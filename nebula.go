@@ -2,6 +2,7 @@ package nebula
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"runtime/debug"
@@ -19,6 +20,7 @@ type Nebula[T any] struct {
 	senderWg   sync.WaitGroup                         // Tracks active Submit calls
 	closed     atomic.Bool
 	logLevel   LogLevel
+	startOnce  sync.Once // NEW: Ensures Start() only spawns workers once
 }
 
 // jobWrapper pairs the user's job with its specific execution context.
@@ -65,57 +67,60 @@ func (n *Nebula[T]) WithFailureTracker(tracker func(job T, err error)) *Nebula[T
 }
 
 func (n *Nebula[T]) Start() {
-	n.logf(LogLevelInfo, "Starting worker pool with %d workers", n.numWorkers)
+	// The code inside Do() is guaranteed to only run once per Nebula instance
+	n.startOnce.Do(func() {
+		n.logf(LogLevelInfo, "Starting worker pool with %d workers", n.numWorkers)
 
-	for i := uint64(0); i < n.numWorkers; i++ {
-		n.wg.Add(1)
+		for i := uint64(0); i < n.numWorkers; i++ {
+			n.wg.Add(1)
 
-		go func(id uint64) {
-			defer func() {
-				n.wg.Done()
-				n.logf(LogLevelDebug, "Worker %d stopped", id)
-			}()
-
-			n.logf(LogLevelDebug, "Worker %d started", id)
-
-			// A range loop blocks waiting for jobs, and automatically
-			// exits once n.jobs is closed AND fully drained.
-			for wrapper := range n.jobs {
-				// 1. Skip the job if it timed out while waiting in the queue!
-				if wrapper.ctx.Err() != nil {
-					n.logf(LogLevelDebug, "Worker %d skipped job (context expired in queue): %v", id, wrapper.job)
-					// Trigger failure tracker for the skipped job
-					n.onFail(wrapper.job, wrapper.ctx.Err())
-					continue
-				}
-
-				n.logf(LogLevelDebug, "Worker %d starting job: %v", id, wrapper.job)
-
-				var err error // Capture the result of the process
-
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							// Convert the panic payload into a standard error
-							err = fmt.Errorf("worker panicked: %v", r)
-							n.logf(LogLevelError, "Worker %d panicked: %v\n%s", id, r, debug.Stack())
-						}
-					}()
-
-					// 2. Pass the context down to the user's function and capture any explicit error
-					err = n.process(wrapper.ctx, wrapper.job)
+			go func(id uint64) {
+				defer func() {
+					n.wg.Done()
+					n.logf(LogLevelDebug, "Worker %d stopped", id)
 				}()
 
-				// 3. Trigger the failure tracker if anything went wrong
-				if err != nil {
-					n.logf(LogLevelDebug, "Worker %d failed job: %v, err: %v", id, wrapper.job, err)
-					n.onFail(wrapper.job, err)
-				} else {
-					n.logf(LogLevelDebug, "Worker %d finished job: %v", id, wrapper.job)
+				n.logf(LogLevelDebug, "Worker %d started", id)
+
+				// A range loop blocks waiting for jobs, and automatically
+				// exits once n.jobs is closed AND fully drained.
+				for wrapper := range n.jobs {
+					// 1. Skip the job if it timed out while waiting in the queue!
+					if wrapper.ctx.Err() != nil {
+						n.logf(LogLevelDebug, "Worker %d skipped job (context expired in queue): %v", id, wrapper.job)
+						// Trigger failure tracker for the skipped job
+						n.onFail(wrapper.job, wrapper.ctx.Err())
+						continue
+					}
+
+					n.logf(LogLevelDebug, "Worker %d starting job: %v", id, wrapper.job)
+
+					var err error // Capture the result of the process
+
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								// Convert the panic payload into a standard error
+								err = fmt.Errorf("worker panicked: %v", r)
+								n.logf(LogLevelError, "Worker %d panicked: %v\n%s", id, r, debug.Stack())
+							}
+						}()
+
+						// 2. Pass the context down to the user's function and capture any explicit error
+						err = n.process(wrapper.ctx, wrapper.job)
+					}()
+
+					// 3. Trigger the failure tracker if anything went wrong
+					if err != nil {
+						n.logf(LogLevelDebug, "Worker %d failed job: %v, err: %v", id, wrapper.job, err)
+						n.onFail(wrapper.job, err)
+					} else {
+						n.logf(LogLevelDebug, "Worker %d finished job: %v", id, wrapper.job)
+					}
 				}
-			}
-		}(i)
-	}
+			}(i)
+		}
+	})
 }
 
 func (n *Nebula[T]) Submit(ctx context.Context, job T) bool {
@@ -156,10 +161,16 @@ func (n *Nebula[T]) Submit(ctx context.Context, job T) bool {
 }
 
 func (n *Nebula[T]) Shutdown(ctx context.Context) error {
-	n.logf(LogLevelInfo, "Initiating graceful shutdown...")
-
+	// Atomically check and update the closed state.
+	// If it was already true, CompareAndSwap returns false, meaning
+	// another goroutine already called Shutdown.
 	n.logf(LogLevelDebug, "Stopping new submissions...")
-	n.closed.Store(true)
+
+	if !n.closed.CompareAndSwap(false, true) {
+		n.logf(LogLevelDebug, "Shutdown rejected: already shutting down or closed")
+		return errors.New("worker pool is already closed")
+	}
+	n.logf(LogLevelInfo, "Initiating graceful shutdown...")
 
 	n.logf(LogLevelDebug, "Unblocking any pending Submit calls...")
 	close(n.done)
