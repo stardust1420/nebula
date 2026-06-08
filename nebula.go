@@ -93,7 +93,7 @@ func (n *Nebula[T]) Start() {
 						continue
 					}
 
-					n.logf(LogLevelDebug, "Worker %d starting job: %v", id, wrapper.job)
+					n.logf(LogLevelDebug, "Worker %d starting job: %+v", id, wrapper.job)
 
 					var err error // Capture the result of the process
 
@@ -112,10 +112,10 @@ func (n *Nebula[T]) Start() {
 
 					// 3. Trigger the failure tracker if anything went wrong
 					if err != nil {
-						n.logf(LogLevelDebug, "Worker %d failed job: %v, err: %v", id, wrapper.job, err)
+						n.logf(LogLevelDebug, "Worker %d failed job: %+v, err: %v", id, wrapper.job, err)
 						n.onFail(wrapper.job, err)
 					} else {
-						n.logf(LogLevelDebug, "Worker %d finished job: %v", id, wrapper.job)
+						n.logf(LogLevelDebug, "Worker %d finished job: %+v", id, wrapper.job)
 					}
 				}
 			}(i)
