@@ -12,7 +12,7 @@ import (
 // TestConsistentHashingDeterministic verifies the same ID always routes to the
 // same worker, and that WorkerFor agrees with actual routing.
 func TestConsistentHashingDeterministic(t *testing.T) {
-	p := NewWithConsistentHashing(func(ctx context.Context, job int) error { return nil }, 8, 16, LogLevelNone)
+	p := mustNewCH(t, func(ctx context.Context, job int) error { return nil }, 8, 16, LogLevelNone)
 	for _, id := range []string{"user-1", "order-42", "abc", "", "long-key-value-xyz"} {
 		first := p.WorkerFor(id)
 		for i := 0; i < 100; i++ {
@@ -30,7 +30,7 @@ func TestConsistentHashingDeterministic(t *testing.T) {
 // than piling onto one.
 func TestConsistentHashingDistribution(t *testing.T) {
 	const workers = 8
-	p := NewWithConsistentHashing(func(ctx context.Context, job int) error { return nil }, workers, 16, LogLevelNone)
+	p := mustNewCH(t, func(ctx context.Context, job int) error { return nil }, workers, 16, LogLevelNone)
 	counts := make(map[uint64]int)
 	for i := 0; i < 10000; i++ {
 		counts[p.WorkerFor(fmt.Sprintf("key-%d", i))]++
@@ -75,7 +75,11 @@ func TestConsistentHashingAffinity(t *testing.T) {
 		mu.Unlock()
 		return nil
 	}
-	p = NewWithConsistentHashing(process, workers, 32, LogLevelNone)
+	var perr error
+	p, perr = NewWithConsistentHashing(process, workers, 32, LogLevelNone)
+	if perr != nil {
+		t.Fatalf("NewWithConsistentHashing error: %v", perr)
+	}
 	p.Start()
 
 	ids := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
@@ -101,7 +105,7 @@ func TestConsistentHashingAffinity(t *testing.T) {
 func TestConsistentHashingAllProcessed(t *testing.T) {
 	const n = 2000
 	var count int64
-	p := NewWithConsistentHashing(func(ctx context.Context, job int) error {
+	p := mustNewCH(t, func(ctx context.Context, job int) error {
 		atomic.AddInt64(&count, 1)
 		return nil
 	}, 8, 32, LogLevelNone)
@@ -124,7 +128,7 @@ func TestConsistentHashingAllProcessed(t *testing.T) {
 // TestConsistentHashingSubmitShutdownRace stresses Submit against Shutdown.
 func TestConsistentHashingSubmitShutdownRace(t *testing.T) {
 	for iter := 0; iter < 300; iter++ {
-		p := NewWithConsistentHashing(func(ctx context.Context, job int) error { return nil }, 4, 8, LogLevelNone)
+		p := mustNewCH(t, func(ctx context.Context, job int) error { return nil }, 4, 8, LogLevelNone)
 		p.Start()
 
 		var wg sync.WaitGroup
@@ -150,12 +154,12 @@ func TestConsistentHashingFailureTracker(t *testing.T) {
 		}
 		return context.DeadlineExceeded
 	}
-	p := NewWithConsistentHashing(process, 3, 8, LogLevelNone).
-		WithFailureTracker(func(job int, err error) {
-			mu.Lock()
-			failures++
-			mu.Unlock()
-		})
+	p := mustNewCH(t, process, 3, 8, LogLevelNone)
+	p.WithFailureTracker(func(job int, err error) {
+		mu.Lock()
+		failures++
+		mu.Unlock()
+	})
 	p.Start()
 	p.Submit(context.Background(), "panic", 0)
 	p.Submit(context.Background(), "err", 1)
@@ -172,7 +176,7 @@ func TestConsistentHashingFailureTracker(t *testing.T) {
 
 // TestConsistentHashingSubmitAfterShutdown ensures Submit is rejected post-shutdown.
 func TestConsistentHashingSubmitAfterShutdown(t *testing.T) {
-	p := NewWithConsistentHashing(func(ctx context.Context, job int) error { return nil }, 2, 4, LogLevelNone)
+	p := mustNewCH(t, func(ctx context.Context, job int) error { return nil }, 2, 4, LogLevelNone)
 	p.Start()
 	if err := p.Shutdown(context.Background()); err != nil {
 		t.Fatalf("shutdown error: %v", err)
@@ -191,7 +195,7 @@ func TestConsistentHashingShutdownTimeout(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 		return nil
 	}
-	p := NewWithConsistentHashing(process, 1, 10, LogLevelNone)
+	p := mustNewCH(t, process, 1, 10, LogLevelNone)
 	p.Start()
 	for i := 0; i < 5; i++ {
 		p.Submit(context.Background(), "same-id", i)
@@ -206,12 +210,38 @@ func TestConsistentHashingShutdownTimeout(t *testing.T) {
 // TestHashRingStableAcrossInstances verifies routing is stable across two pools
 // built with the same worker count (same ring construction).
 func TestHashRingStableAcrossInstances(t *testing.T) {
-	p1 := NewWithConsistentHashing(func(ctx context.Context, job int) error { return nil }, 5, 4, LogLevelNone)
-	p2 := NewWithConsistentHashing(func(ctx context.Context, job int) error { return nil }, 5, 4, LogLevelNone)
+	p1 := mustNewCH(t, func(ctx context.Context, job int) error { return nil }, 5, 4, LogLevelNone)
+	p2 := mustNewCH(t, func(ctx context.Context, job int) error { return nil }, 5, 4, LogLevelNone)
 	for i := 0; i < 500; i++ {
 		id := fmt.Sprintf("entity-%d", i)
 		if p1.WorkerFor(id) != p2.WorkerFor(id) {
 			t.Fatalf("id %q routed differently across identical pools", id)
 		}
+	}
+}
+
+// mustNewCH is a test helper that constructs a consistent-hashing pool and fails
+// the test on error.
+func mustNewCH(t *testing.T, process func(ctx context.Context, job int) error, numWorkers, queueSize uint64, level LogLevel) *NebulaWithConsistentHashing[int] {
+	t.Helper()
+	p, err := NewWithConsistentHashing(process, numWorkers, queueSize, level)
+	if err != nil {
+		t.Fatalf("NewWithConsistentHashing returned unexpected error: %v", err)
+	}
+	return p
+}
+
+// TestNewWithConsistentHashingZeroWorkers verifies the constructor rejects a
+// zero worker count.
+func TestNewWithConsistentHashingZeroWorkers(t *testing.T) {
+	p, err := NewWithConsistentHashing(func(ctx context.Context, job int) error { return nil }, 0, 8, LogLevelNone)
+	if err == nil {
+		t.Fatal("expected error for zero workers")
+	}
+	if p != nil {
+		t.Fatal("expected nil pool on error")
+	}
+	if err != ErrNoWorkers {
+		t.Fatalf("expected ErrNoWorkers, got %v", err)
 	}
 }

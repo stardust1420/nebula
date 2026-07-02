@@ -39,7 +39,11 @@ func NewWithConsistentHashing[T any](
 	numWorkers uint64,
 	queueSize uint64,
 	logLevel LogLevel,
-) *NebulaWithConsistentHashing[T] {
+) (*NebulaWithConsistentHashing[T], error) {
+
+	if numWorkers == 0 {
+		return nil, ErrNoWorkers
+	}
 
 	chans := make([]chan JobWithCtx[T], numWorkers)
 	for i := range chans {
@@ -54,7 +58,7 @@ func NewWithConsistentHashing[T any](
 		onFail:     func(job T, err error) {}, // Safe default (no-op)
 		logLevel:   logLevel,
 		ring:       newHashRing(numWorkers, defaultVirtualNodes),
-	}
+	}, nil
 }
 
 // WithFailureTracker attaches a callback for failed, panicked, or queue-expired
@@ -95,12 +99,6 @@ func (n *NebulaWithConsistentHashing[T]) Submit(ctx context.Context, id string, 
 	// Fast fail if we are already closed
 	if n.closed.Load() {
 		n.logf(LogLevelDebug, "Submit rejected: worker pool is already closed")
-		return false
-	}
-
-	// Nothing to route to.
-	if n.numWorkers == 0 {
-		n.logf(LogLevelDebug, "Submit rejected: pool has no workers")
 		return false
 	}
 

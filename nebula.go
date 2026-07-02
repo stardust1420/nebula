@@ -39,12 +39,20 @@ const (
 	LogLevelDebug                 // 3: Log every worker start/stop and job submission
 )
 
+// ErrNoWorkers is returned by the constructors when numWorkers is zero. A pool
+// with no workers can never process a job, so it is rejected up front.
+var ErrNoWorkers = errors.New("nebula: numWorkers must be greater than zero")
+
 func New[T any](
 	process func(ctx context.Context, job T) error, // Updated signature
 	numWorkers uint64,
 	queueSize uint64,
 	logLevel LogLevel,
-) *Nebula[T] {
+) (*Nebula[T], error) {
+
+	if numWorkers == 0 {
+		return nil, ErrNoWorkers
+	}
 
 	jobsChan := make(chan JobWithCtx[T], queueSize)
 	doneChan := make(chan struct{})
@@ -57,7 +65,7 @@ func New[T any](
 		wg:         sync.WaitGroup{},
 		logLevel:   logLevel,
 		onFail:     func(job T, err error) {}, // Safe default (no-op)
-	}
+	}, nil
 }
 
 // WithFailureTracker allows users to attach a callback for failed or panicked jobs.

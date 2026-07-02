@@ -13,7 +13,7 @@ import (
 func TestSubmitShutdownRace(t *testing.T) {
 	for iter := 0; iter < 300; iter++ {
 		process := func(ctx context.Context, job int) error { return nil }
-		p := New(process, 4, 8, LogLevelNone)
+		p := mustNew(t, process, 4, 8, LogLevelNone)
 		p.Start()
 
 		var wg sync.WaitGroup
@@ -38,7 +38,7 @@ func TestAllJobsProcessed(t *testing.T) {
 		atomic.AddInt64(&count, 1)
 		return nil
 	}
-	p := New(process, 8, 64, LogLevelNone)
+	p := mustNew(t, process, 8, 64, LogLevelNone)
 	p.Start()
 
 	accepted := 0
@@ -57,7 +57,7 @@ func TestAllJobsProcessed(t *testing.T) {
 
 // TestSubmitAfterShutdown ensures Submit is rejected after shutdown.
 func TestSubmitAfterShutdown(t *testing.T) {
-	p := New(func(ctx context.Context, job int) error { return nil }, 2, 4, LogLevelNone)
+	p := mustNew(t, func(ctx context.Context, job int) error { return nil }, 2, 4, LogLevelNone)
 	p.Start()
 	if err := p.Shutdown(context.Background()); err != nil {
 		t.Fatalf("shutdown returned error: %v", err)
@@ -70,7 +70,7 @@ func TestSubmitAfterShutdown(t *testing.T) {
 // TestDoubleShutdown ensures a second Shutdown reports an error and does not
 // panic (e.g. double close of channels).
 func TestDoubleShutdown(t *testing.T) {
-	p := New(func(ctx context.Context, job int) error { return nil }, 2, 4, LogLevelNone)
+	p := mustNew(t, func(ctx context.Context, job int) error { return nil }, 2, 4, LogLevelNone)
 	p.Start()
 	if err := p.Shutdown(context.Background()); err != nil {
 		t.Fatalf("first shutdown returned error: %v", err)
@@ -91,12 +91,12 @@ func TestFailureTracker(t *testing.T) {
 		}
 		return context.DeadlineExceeded
 	}
-	p := New(process, 1, 8, LogLevelNone).
-		WithFailureTracker(func(job int, err error) {
-			mu.Lock()
-			failures++
-			mu.Unlock()
-		})
+	p := mustNew(t, process, 1, 8, LogLevelNone)
+	p.WithFailureTracker(func(job int, err error) {
+		mu.Lock()
+		failures++
+		mu.Unlock()
+	})
 	p.Start()
 	p.Submit(context.Background(), 0) // panics
 	p.Submit(context.Background(), 1) // returns error
@@ -118,7 +118,7 @@ func TestShutdownTimeout(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 		return nil
 	}
-	p := New(process, 1, 10, LogLevelNone)
+	p := mustNew(t, process, 1, 10, LogLevelNone)
 	p.Start()
 	for i := 0; i < 5; i++ {
 		p.Submit(context.Background(), i)
@@ -127,5 +127,29 @@ func TestShutdownTimeout(t *testing.T) {
 	defer cancel()
 	if err := p.Shutdown(ctx); err == nil {
 		t.Fatal("expected timeout error from Shutdown")
+	}
+}
+
+// mustNew is a test helper that constructs a pool and fails the test on error.
+func mustNew(t *testing.T, process func(ctx context.Context, job int) error, numWorkers, queueSize uint64, level LogLevel) *Nebula[int] {
+	t.Helper()
+	p, err := New(process, numWorkers, queueSize, level)
+	if err != nil {
+		t.Fatalf("New returned unexpected error: %v", err)
+	}
+	return p
+}
+
+// TestNewZeroWorkers verifies New rejects a zero worker count.
+func TestNewZeroWorkers(t *testing.T) {
+	p, err := New(func(ctx context.Context, job int) error { return nil }, 0, 8, LogLevelNone)
+	if err == nil {
+		t.Fatal("expected error for zero workers")
+	}
+	if p != nil {
+		t.Fatal("expected nil pool on error")
+	}
+	if err != ErrNoWorkers {
+		t.Fatalf("expected ErrNoWorkers, got %v", err)
 	}
 }

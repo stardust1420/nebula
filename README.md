@@ -33,18 +33,30 @@ The library has no third-party dependencies and targets Go 1.24 or later
 ## Installation
 
 ```sh
-go get github.com/stardust1420/nebula
+go get github.com/stardust1420/nebula/v2
 ```
 
 ```go
-import "github.com/stardust1420/nebula"
+import "github.com/stardust1420/nebula/v2"
 ```
+
+The import path and package usage stay `nebula`; only the module path carries
+the `/v2` suffix (required by Go modules for major version 2 and above).
+
+### Upgrading from v1
+
+`v2` contains breaking changes, so it is a separate module path and existing
+`v1` users are unaffected until they opt in. When you upgrade:
+
+- `New` and `NewWithConsistentHashing` now return `(*pool, error)` instead of
+  just `*pool`. Handle the returned error (it is `ErrNoWorkers` when
+  `numWorkers` is `0`) — see the examples below.
 
 ## API overview
 
 | Function | Description |
 | --- | --- |
-| `New[T](process, numWorkers, queueSize, logLevel)` | Constructs a pool. `process` has signature `func(ctx context.Context, job T) error`. |
+| `New[T](process, numWorkers, queueSize, logLevel)` | Constructs a pool. `process` has signature `func(ctx context.Context, job T) error`. Returns `(*Nebula[T], error)`; the error is non-nil (`ErrNoWorkers`) when `numWorkers` is `0`. |
 | `(*Nebula[T]).WithFailureTracker(fn)` | Registers a `func(job T, err error)` callback for failed, panicked, or skipped jobs. Returns the pool for chaining. |
 | `(*Nebula[T]).Start()` | Launches the worker goroutines. |
 | `(*Nebula[T]).Submit(ctx, job) bool` | Enqueues a job. Returns `false` if the pool is closed or the context expires before the job is queued. |
@@ -71,7 +83,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/stardust1420/nebula"
+	"github.com/stardust1420/nebula/v2"
 )
 
 func main() {
@@ -82,7 +94,10 @@ func main() {
 	}
 
 	// 4 workers, queue capacity of 100, silent logging.
-	pool := nebula.New(process, 4, 100, nebula.LogLevelNone)
+	pool, err := nebula.New(process, 4, 100, nebula.LogLevelNone)
+	if err != nil {
+		panic(err) // only errors when numWorkers == 0
+	}
 	pool.Start()
 
 	for i := 0; i < 10; i++ {
@@ -113,10 +128,13 @@ process := func(ctx context.Context, job string) error {
 	return doWork(ctx, job)
 }
 
-pool := nebula.New(process, 8, 256, nebula.LogLevelError).
-	WithFailureTracker(func(job string, err error) {
-		log.Printf("job %q failed: %v", job, err)
-	})
+pool, err := nebula.New(process, 8, 256, nebula.LogLevelError)
+if err != nil {
+	panic(err)
+}
+pool.WithFailureTracker(func(job string, err error) {
+	log.Printf("job %q failed: %v", job, err)
+})
 
 pool.Start()
 ```
@@ -158,7 +176,7 @@ logging, and context-aware graceful shutdown. The only API difference is that
 
 | Function | Description |
 | --- | --- |
-| `NewWithConsistentHashing[T](process, numWorkers, queueSize, logLevel)` | Constructs a pool with one channel per worker. `queueSize` is the capacity of *each* worker channel. |
+| `NewWithConsistentHashing[T](process, numWorkers, queueSize, logLevel)` | Constructs a pool with one channel per worker. `queueSize` is the capacity of *each* worker channel. Returns `(*NebulaWithConsistentHashing[T], error)`; the error is `ErrNoWorkers` when `numWorkers` is `0`. |
 | `(*NebulaWithConsistentHashing[T]).WithFailureTracker(fn)` | Same as the plain pool. Returns the pool for chaining. |
 | `(*NebulaWithConsistentHashing[T]).Start()` | Launches the worker goroutines. |
 | `(*NebulaWithConsistentHashing[T]).Submit(ctx, id, job) bool` | Routes `job` to the worker for `id` and enqueues it. Returns `false` if the pool is closed/closing or the context expires first. |
@@ -170,7 +188,10 @@ process := func(ctx context.Context, ev Event) error {
 	return applyToAccount(ctx, ev.AccountID, ev)
 }
 
-pool := nebula.NewWithConsistentHashing(process, 8, 128, nebula.LogLevelNone)
+pool, err := nebula.NewWithConsistentHashing(process, 8, 128, nebula.LogLevelNone)
+if err != nil {
+	panic(err)
+}
 pool.Start()
 
 // Every event for the same account is processed by the same worker, in order.
