@@ -144,6 +144,47 @@ If `Submit` is called with a full queue, it blocks until a slot is free, the
 context is cancelled, or the pool begins shutting down — whichever happens
 first. The boolean return value reports whether the job was accepted.
 
+## Consistent hashing (per-key worker affinity)
+
+`NewWithConsistentHashing` builds a variant of the pool where **each worker owns
+its own job channel** and every `Submit` requires a string `id`. The id is hashed
+onto a consistent-hash ring, so **all jobs sharing an id are always handled by the
+same worker goroutine**. This gives per-key ordering and affinity — useful for
+stateful processing, in-order event streams per entity, or cache locality.
+
+It shares the plain pool's lifecycle, panic recovery, failure tracking, leveled
+logging, and context-aware graceful shutdown. The only API difference is that
+`Submit` takes an id.
+
+| Function | Description |
+| --- | --- |
+| `NewWithConsistentHashing[T](process, numWorkers, queueSize, logLevel)` | Constructs a pool with one channel per worker. `queueSize` is the capacity of *each* worker channel. |
+| `(*NebulaWithConsistentHashing[T]).WithFailureTracker(fn)` | Same as the plain pool. Returns the pool for chaining. |
+| `(*NebulaWithConsistentHashing[T]).Start()` | Launches the worker goroutines. |
+| `(*NebulaWithConsistentHashing[T]).Submit(ctx, id, job) bool` | Routes `job` to the worker for `id` and enqueues it. Returns `false` if the pool is closed/closing or the context expires first. |
+| `(*NebulaWithConsistentHashing[T]).WorkerFor(id) uint64` | Reports the worker index an id routes to. Deterministic; handy for tests, metrics, and debugging. |
+| `(*NebulaWithConsistentHashing[T]).Shutdown(ctx) error` | Closes every worker channel and drains. Returns `ctx.Err()` on deadline. |
+
+```go
+process := func(ctx context.Context, ev Event) error {
+	return applyToAccount(ctx, ev.AccountID, ev)
+}
+
+pool := nebula.NewWithConsistentHashing(process, 8, 128, nebula.LogLevelNone)
+pool.Start()
+
+// Every event for the same account is processed by the same worker, in order.
+pool.Submit(context.Background(), ev.AccountID, ev)
+
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+_ = pool.Shutdown(ctx)
+```
+
+The ring uses FNV-1a hashing with virtual nodes for an even key distribution.
+Routing is stable for the lifetime of a pool and identical across pools created
+with the same worker count.
+
 ## Lifecycle and semantics
 
 - **Start once.** Call `Start` a single time per pool. Submitting before

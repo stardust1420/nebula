@@ -75,52 +75,63 @@ func (n *Nebula[T]) Start() {
 			n.wg.Add(1)
 
 			go func(id uint64) {
-				defer func() {
-					n.wg.Done()
-					n.logf(LogLevelDebug, "Worker %d stopped", id)
-				}()
-
-				n.logf(LogLevelDebug, "Worker %d started", id)
-
-				// A range loop blocks waiting for jobs, and automatically
-				// exits once n.jobs is closed AND fully drained.
-				for jobWithCtx := range n.jobs {
-					// 1. Skip the job if it timed out while waiting in the queue!
-					if jobWithCtx.ctx.Err() != nil {
-						n.logf(LogLevelDebug, "Worker %d skipped job (context expired in queue): %v", id, jobWithCtx.job)
-						// Trigger failure tracker for the skipped job
-						n.onFail(jobWithCtx.job, jobWithCtx.ctx.Err())
-						continue
-					}
-
-					n.logf(LogLevelDebug, "Worker %d starting job: %+v", id, jobWithCtx.job)
-
-					var err error // Capture the result of the process
-
-					func() {
-						defer func() {
-							if r := recover(); r != nil {
-								// Convert the panic payload into a standard error
-								err = fmt.Errorf("worker panicked: %v", r)
-								n.logf(LogLevelError, "Worker %d panicked: %v\n%s", id, r, debug.Stack())
-							}
-						}()
-
-						// 2. Pass the context down to the user's function and capture any explicit error
-						err = n.process(jobWithCtx.ctx, jobWithCtx.job)
-					}()
-
-					// 3. Trigger the failure tracker if anything went wrong
-					if err != nil {
-						n.logf(LogLevelDebug, "Worker %d failed job: %+v, err: %v", id, jobWithCtx.job, err)
-						n.onFail(jobWithCtx.job, err)
-					} else {
-						n.logf(LogLevelDebug, "Worker %d finished job: %+v", id, jobWithCtx.job)
-					}
-				}
+				defer n.wg.Done()
+				runWorker(id, n.jobs, n.process, n.onFail, n.logf)
 			}(i)
 		}
 	})
+}
+
+// runWorker drains a single job channel until it is closed. It is shared by the
+// plain pool (one channel) and the consistent-hashing pool (one channel per
+// worker); the routing that decides which channel a job lands on lives in the
+// respective Submit methods.
+func runWorker[T any](
+	id uint64,
+	jobs <-chan JobWithCtx[T],
+	process func(ctx context.Context, job T) error,
+	onFail func(job T, err error),
+	logf func(level LogLevel, format string, args ...any),
+) {
+	logf(LogLevelDebug, "Worker %d started", id)
+	defer logf(LogLevelDebug, "Worker %d stopped", id)
+
+	// A range loop blocks waiting for jobs, and automatically
+	// exits once the channel is closed AND fully drained.
+	for jobWithCtx := range jobs {
+		// 1. Skip the job if it timed out while waiting in the queue!
+		if jobWithCtx.ctx.Err() != nil {
+			logf(LogLevelDebug, "Worker %d skipped job (context expired in queue): %v", id, jobWithCtx.job)
+			// Trigger failure tracker for the skipped job
+			onFail(jobWithCtx.job, jobWithCtx.ctx.Err())
+			continue
+		}
+
+		logf(LogLevelDebug, "Worker %d starting job: %+v", id, jobWithCtx.job)
+
+		var err error // Capture the result of the process
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Convert the panic payload into a standard error
+					err = fmt.Errorf("worker panicked: %v", r)
+					logf(LogLevelError, "Worker %d panicked: %v\n%s", id, r, debug.Stack())
+				}
+			}()
+
+			// 2. Pass the context down to the user's function and capture any explicit error
+			err = process(jobWithCtx.ctx, jobWithCtx.job)
+		}()
+
+		// 3. Trigger the failure tracker if anything went wrong
+		if err != nil {
+			logf(LogLevelDebug, "Worker %d failed job: %+v, err: %v", id, jobWithCtx.job, err)
+			onFail(jobWithCtx.job, err)
+		} else {
+			logf(LogLevelDebug, "Worker %d finished job: %+v", id, jobWithCtx.job)
+		}
+	}
 }
 
 func (n *Nebula[T]) Submit(ctx context.Context, job T) bool {
@@ -212,8 +223,13 @@ func (n *Nebula[T]) Shutdown(ctx context.Context) error {
 }
 
 func (n *Nebula[T]) logf(level LogLevel, format string, args ...any) {
-	// If the pool's configured level is lower than the message's level, ignore it.
-	if n.logLevel < level {
+	logAt(n.logLevel, level, format, args...)
+}
+
+// logAt is the shared logging routine used by every pool variant. If the
+// configured level is lower than the message's level, the message is dropped.
+func logAt(configured, level LogLevel, format string, args ...any) {
+	if configured < level {
 		return
 	}
 
