@@ -183,7 +183,8 @@ first. The boolean return value reports whether the job was accepted.
 
 ## Concurrency notes
 
-Internally the pool uses a buffered channel for jobs, separate wait groups to
-track active workers and in-flight `Submit` calls, and an atomic flag to mark
-closure. This ordering lets `Shutdown` close the job channel only after all
-pending sends have completed, avoiding sends on a closed channel.
+Internally the pool uses a buffered channel for jobs, a wait group to track
+active workers, and an atomic flag guarded by a read/write mutex to mark
+closure. `Submit` holds a read lock while sending; `Shutdown` takes the write
+lock before closing the job channel, so the channel is only closed once no send
+is in flight, avoiding sends on a closed channel.

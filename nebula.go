@@ -12,19 +12,19 @@ import (
 
 type Nebula[T any] struct {
 	numWorkers uint64
-	jobs       chan jobWrapper[T] // Now holds the wrapper
+	jobs       chan JobWithCtx[T] // Now holds the jobWithCtx
 	done       chan struct{}
 	process    func(ctx context.Context, job T) error // Now takes ctx and returns error
 	onFail     func(job T, err error)                 // Callback for failed/panicked jobs
 	wg         sync.WaitGroup                         // Tracks active workers
-	senderWg   sync.WaitGroup                         // Tracks active Submit calls
+	mu         sync.RWMutex                           // Guards sends against closing n.jobs
 	closed     atomic.Bool
 	logLevel   LogLevel
 	startOnce  sync.Once // NEW: Ensures Start() only spawns workers once
 }
 
-// jobWrapper pairs the user's job with its specific execution context.
-type jobWrapper[T any] struct {
+// JobWithCtx pairs the user's job with its specific execution context.
+type JobWithCtx[T any] struct {
 	ctx context.Context
 	job T
 }
@@ -46,7 +46,7 @@ func New[T any](
 	logLevel LogLevel,
 ) *Nebula[T] {
 
-	jobsChan := make(chan jobWrapper[T], queueSize)
+	jobsChan := make(chan JobWithCtx[T], queueSize)
 	doneChan := make(chan struct{})
 
 	return &Nebula[T]{
@@ -84,16 +84,16 @@ func (n *Nebula[T]) Start() {
 
 				// A range loop blocks waiting for jobs, and automatically
 				// exits once n.jobs is closed AND fully drained.
-				for wrapper := range n.jobs {
+				for jobWithCtx := range n.jobs {
 					// 1. Skip the job if it timed out while waiting in the queue!
-					if wrapper.ctx.Err() != nil {
-						n.logf(LogLevelDebug, "Worker %d skipped job (context expired in queue): %v", id, wrapper.job)
+					if jobWithCtx.ctx.Err() != nil {
+						n.logf(LogLevelDebug, "Worker %d skipped job (context expired in queue): %v", id, jobWithCtx.job)
 						// Trigger failure tracker for the skipped job
-						n.onFail(wrapper.job, wrapper.ctx.Err())
+						n.onFail(jobWithCtx.job, jobWithCtx.ctx.Err())
 						continue
 					}
 
-					n.logf(LogLevelDebug, "Worker %d starting job: %+v", id, wrapper.job)
+					n.logf(LogLevelDebug, "Worker %d starting job: %+v", id, jobWithCtx.job)
 
 					var err error // Capture the result of the process
 
@@ -107,15 +107,15 @@ func (n *Nebula[T]) Start() {
 						}()
 
 						// 2. Pass the context down to the user's function and capture any explicit error
-						err = n.process(wrapper.ctx, wrapper.job)
+						err = n.process(jobWithCtx.ctx, jobWithCtx.job)
 					}()
 
 					// 3. Trigger the failure tracker if anything went wrong
 					if err != nil {
-						n.logf(LogLevelDebug, "Worker %d failed job: %+v, err: %v", id, wrapper.job, err)
-						n.onFail(wrapper.job, err)
+						n.logf(LogLevelDebug, "Worker %d failed job: %+v, err: %v", id, jobWithCtx.job, err)
+						n.onFail(jobWithCtx.job, err)
 					} else {
-						n.logf(LogLevelDebug, "Worker %d finished job: %+v", id, wrapper.job)
+						n.logf(LogLevelDebug, "Worker %d finished job: %+v", id, jobWithCtx.job)
 					}
 				}
 			}(i)
@@ -130,18 +130,21 @@ func (n *Nebula[T]) Submit(ctx context.Context, job T) bool {
 		return false
 	}
 
-	// Register this active send operation
-	n.senderWg.Add(1)
-	defer n.senderWg.Done()
+	// Hold the read lock for the duration of the send. Shutdown takes the
+	// write lock before closing n.jobs, so while we hold this lock the channel
+	// cannot be closed underneath us. Many Submits can proceed concurrently.
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 
-	// Double-check in case Shutdown was called between step 1 and 2
+	// Re-check under the lock: if Shutdown flipped closed before we acquired
+	// the read lock, bail out without touching the channel.
 	if n.closed.Load() {
 		n.logf(LogLevelDebug, "Submit aborted: pool closed during submission")
 		return false
 	}
 
 	// Package the job and context together
-	wrapper := jobWrapper[T]{ctx: ctx, job: job}
+	jobWithCtx := JobWithCtx[T]{ctx: ctx, job: job}
 
 	// Try to send
 	select {
@@ -154,7 +157,7 @@ func (n *Nebula[T]) Submit(ctx context.Context, job T) bool {
 		// before we can push it to the channel, abort the send.
 		n.logf(LogLevelDebug, "Submit canceled: context expired before entering queue")
 		return false
-	case n.jobs <- wrapper:
+	case n.jobs <- jobWithCtx:
 		n.logf(LogLevelDebug, "Job successfully submitted: %v", job)
 		return true
 	}
@@ -175,11 +178,15 @@ func (n *Nebula[T]) Shutdown(ctx context.Context) error {
 	n.logf(LogLevelDebug, "Unblocking any pending Submit calls...")
 	close(n.done)
 
+	// Acquire the write lock so that every in-flight Submit (each holding the
+	// read lock) has returned. Once we hold it, no Submit can be inside its
+	// send, so it is safe to close the jobs channel. New Submits already see
+	// closed == true and never take the lock.
 	n.logf(LogLevelDebug, "Waiting for active Submits to exit...")
-	n.senderWg.Wait()
-
+	n.mu.Lock()
 	n.logf(LogLevelDebug, "Safely closing the jobs channel...")
 	close(n.jobs)
+	n.mu.Unlock()
 
 	// 1. Create a channel to signal when workers are naturally finished
 	workersDone := make(chan struct{})
